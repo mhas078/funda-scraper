@@ -15,6 +15,8 @@ from tqdm.contrib.concurrent import process_map
 from funda_scraper.config.core import config
 from funda_scraper.preprocess import clean_list_date, preprocess_data
 from funda_scraper.utils import logger
+import asyncio
+import aiohttp
 
 
 class FundaScraper(object):
@@ -174,12 +176,36 @@ class FundaScraper(object):
       result = "na"
     return result
 
-  def scrape_one_link(self, link: str) -> List[str]:
+  async def fetch(self, session, url):
+    async with session.get(url) as response:
+      if response.status != 200:
+        response.raise_for_status()
+      text = await response.text()
+      return [url, text]
+
+  async def fetch_all(self, urls):
+    tasks = []
+    async with aiohttp.ClientSession() as session:
+      for url in urls:
+        task = asyncio.create_task(self.fetch(session, url))
+        tasks.append(task)
+      results = await asyncio.gather(*tasks)
+      return results
+
+  async def download_one_link(self, link: str) -> List[str]:
     """Scrape all the features from one house item given a link."""
 
     # Initialize for each page
-    response = requests.get(link, headers=config.header)
-    soup = BeautifulSoup(response.text, "lxml")
+    loop = asyncio.get_event_loop()
+    logger.info("*** Phase 2: Getting one link ***")
+    future = loop.run_in_executor(
+        None, lambda x: requests.get(x, headers=config.header), link)
+    response = await future
+    return response.text
+
+  def process_one_link(self, response_text) -> List[str]:
+    # logger.info("*** Phase 2: Received response ***")
+    soup = BeautifulSoup(response_text, "lxml")
 
     # Get the value according to respective CSS selectors
     if self.to_buy:
@@ -194,7 +220,6 @@ class FundaScraper(object):
         list_since_selector = ".fd-align-items-center:nth-child(7) span"
 
     result = [
-        link,
         self.get_value_from_css(soup, self.selectors.price),
         self.get_value_from_css(soup, self.selectors.address),
         self.get_value_from_css(soup, self.selectors.descrip),
@@ -242,20 +267,25 @@ class FundaScraper(object):
     # Clean up the retried result from one page
     result = [r.replace("\n", "").replace("\r", "").strip() for r in result]
     result.append(photos_string)
+    # logger.info("*** Phase 2: processed response ***")
     return result
 
-  def scrape_pages(self) -> None:
+  def flatten(self, xss):
+    return [x for xs in xss for x in xs]
+  
+  async def scrape_pages(self) -> None:
     """Scrape all the content acoss multiple pages."""
 
     logger.info("*** Phase 2: Start scraping from individual links ***")
     df = pd.DataFrame({key: [] for key in self.selectors.keys()})
 
-    # Scrape pages with multiprocessing to improve efficiency
-    # TODO: use asynctio instead
-    pools = mp.cpu_count()
-    content = process_map(self.scrape_one_link, self.links, max_workers=pools)
-
-    for i, c in enumerate(content):
+    contents = await self.fetch_all(self.links)
+    # contents = await asyncio.gather(
+    #     *[self.download_one_link(link) for link in self.links])
+    contents = [self.flatten([[page[1]],self.process_one_link(page[0])]) for page in contents]
+    logger.info(
+        "*** Phase 2: Downloaded all the links, now processing them ***")
+    for i, c in enumerate(contents):
       df.loc[len(df)] = c
 
     df["city"] = df["url"].map(lambda x: x.split("/")[4])
@@ -276,10 +306,10 @@ class FundaScraper(object):
     df.to_csv(filepath, index=False)
     logger.info(f"*** File saved: {filepath}. ***")
 
-  def run(self,
-          raw_data: bool = False,
-          save: bool = False,
-          filepath: str = None) -> pd.DataFrame:
+  async def run(self,
+                raw_data: bool = False,
+                save: bool = False,
+                filepath: str = None) -> pd.DataFrame:
     """
         Scrape all links and all content.
 
@@ -289,7 +319,7 @@ class FundaScraper(object):
         :return: the (pre-processed) dataframe from scraping
         """
     self.fetch_all_links()
-    self.scrape_pages()
+    await self.scrape_pages()
 
     if raw_data:
       df = self.raw_df
