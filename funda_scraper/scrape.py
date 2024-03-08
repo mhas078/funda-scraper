@@ -80,16 +80,26 @@ class FundaScraper(object):
     if not os.path.exists("data"):
       os.makedirs("data")
 
-  @staticmethod
-  def _get_links_from_one_parent(url: str) -> List[str]:
+  async def get_links_from_all_parent(self, urls: List[str]) -> List[str]:
     """Scrape all the available housing items from one Funda search page."""
-    response = requests.get(url, headers=config.header)
-    soup = BeautifulSoup(response.text, "lxml")
+    # Fetch all urls
+    responses = await self.fetch_all(urls)
+    response_texts = [response[1] for response in responses]
+    return self.process_parent_links(response_texts)
 
-    script_tag = soup.find_all("script", {"type": "application/ld+json"})[0]
-    json_data = json.loads(script_tag.contents[0])
-    urls = [item["url"] for item in json_data["itemListElement"]]
-    return list(set(urls))
+  def process_parent_links(self, response_texts: List[str]) -> List[str]:
+    all_children = []
+    for text in response_texts:
+      soup = BeautifulSoup(text, "lxml")
+      script_tags = soup.find_all("script", {"type": "application/ld+json"})
+      if len(script_tags) == 0:
+        print(text)
+
+      script_tag = soup.find_all("script", {"type": "application/ld+json"})[0]
+      json_data = json.loads(script_tag.contents[0])
+      all_children += [item["url"] for item in json_data["itemListElement"]]
+
+    return list(set(all_children))
 
   def reset(
       self,
@@ -117,9 +127,9 @@ class FundaScraper(object):
     if max_price is not None:
       self.max_price = max_price
 
-  def fetch_all_links(self,
-                      page_start: int = None,
-                      n_pages: int = None) -> None:
+  async def fetch_all_links(self,
+                            page_start: int = None,
+                            n_pages: int = None) -> None:
     """Find all the available links across multiple pages."""
 
     page_start = self.page_start if page_start is None else page_start
@@ -127,19 +137,18 @@ class FundaScraper(object):
 
     logger.info(
         "*** Phase 1: Fetch all the available links from all pages *** ")
-    urls = []
     main_url = self._build_main_query_url()
 
-    for i in tqdm(range(page_start, page_start + n_pages)):
-      try:
-        item_list = self._get_links_from_one_parent(
-            f"{main_url}&search_result={i}")
-        urls += item_list
-      except IndexError:
-        self.page_end = i
-        logger.info(f"*** The last available page is {self.page_end} ***")
-        break
+    urls = [
+        f"{main_url}&search_result={i}"
+        for i in tqdm(range(page_start, page_start + n_pages))
+    ]
+    # Save urls to file
+    child_urls = await self.get_links_from_all_parent(urls)
+    # Save child_urls to file
+    print(child_urls)
 
+    urls = self.flatten(child_urls)
     urls = list(set(urls))
     logger.info(
         f"*** Got all the urls. {len(urls)} houses found from {self.page_start} to {self.page_end} ***"
@@ -177,6 +186,7 @@ class FundaScraper(object):
     return result
 
   async def fetch(self, session, url):
+    await asyncio.sleep(1)
     async with session.get(url) as response:
       if response.status != 200:
         response.raise_for_status()
@@ -185,7 +195,7 @@ class FundaScraper(object):
 
   async def fetch_all(self, urls):
     tasks = []
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=config.header) as session:
       for url in urls:
         task = asyncio.create_task(self.fetch(session, url))
         tasks.append(task)
@@ -272,7 +282,7 @@ class FundaScraper(object):
 
   def flatten(self, xss):
     return [x for xs in xss for x in xs]
-  
+
   async def scrape_pages(self) -> None:
     """Scrape all the content acoss multiple pages."""
 
@@ -282,7 +292,10 @@ class FundaScraper(object):
     contents = await self.fetch_all(self.links)
     # contents = await asyncio.gather(
     #     *[self.download_one_link(link) for link in self.links])
-    contents = [self.flatten([[page[1]],self.process_one_link(page[0])]) for page in contents]
+    contents = [
+        self.flatten([[page[0]], self.process_one_link(page[1])])
+        for page in contents
+    ]
     logger.info(
         "*** Phase 2: Downloaded all the links, now processing them ***")
     for i, c in enumerate(contents):
@@ -318,7 +331,7 @@ class FundaScraper(object):
         :param filepath: the name for the file
         :return: the (pre-processed) dataframe from scraping
         """
-    self.fetch_all_links()
+    await self.fetch_all_links()
     await self.scrape_pages()
 
     if raw_data:
